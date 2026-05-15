@@ -1,10 +1,16 @@
-venv/
+# Runtime outputs
+logs/
+outputs/
+
+# Datasets
+datasets/
+
+# Calibration exports
+homography_calibration.json
+
+# Python cache
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.env
-.idea/
-.vscode/
-runs/
-*.pt
+
+# Virtual environment
+venv/
