@@ -1,0 +1,53 @@
+model:
+  path: "models/yolov8n.pt"
+  confidence_threshold: 0.45
+  iou_threshold: 0.5
+  device: "cpu"            # change to "0" for GPU, "mps" for Apple Silicon
+
+camera:
+  source: "datasets/traffic.mp4"               # 0 = webcam, or "/dev/video0" on Pi, or "rtsp://..."
+  width: 1280
+  height: 720
+  fps_target: 30
+
+vehicle_classes:
+  2: "car"
+  3: "motorcycle"
+  5: "bus"
+  7: "truck"
+
+lanes:
+  enabled: true
+  regions:
+    - name: "Lane_1"
+      points: [[0, 300], [640, 300], [640, 720], [0, 720]]
+    - name: "Lane_2"
+      points: [[640, 300], [1280, 300], [1280, 720], [640, 720]]
+
+analytics:
+  density_thresholds:
+    low: 3
+    medium: 8
+    high: 15
+  snapshot_interval_seconds: 10
+  output_dir: "outputs/"
+
+logging:
+  level: "INFO"
+  log_dir: "logs/"
+
+
+tracker:
+  pixels_per_meter: 91.4      # calibrate: lane_width_px / 3.5m
+  stop_speed_kmh: 3.0         # below this = vehicle considered stopped
+  wrong_way_angle_gap_deg: 150.0
+  min_track_age_frames: 5     # ignore brand-new detections
+
+  lanes:
+  enabled: true
+  expected_direction: "RIGHT"    # ← add this line
+  regions:
+    - name: "Lane_1"
+      points: [[0, 300], [640, 300], [640, 720], [0, 720]]
+    - name: "Lane_2"
+      points: [[640, 300], [1280, 300], [1280, 720], [640, 720]]

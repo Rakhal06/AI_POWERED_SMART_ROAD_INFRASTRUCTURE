@@ -1,0 +1,44 @@
+{
+  "timestamp": 1778872113.37,
+  "fps": 13.18,
+  "total_vehicles": 9,
+  "density_level": "HIGH",
+  "flow_rate_per_min": 6723.34,
+  "lane_counts": {
+    "OUT_OF_ROI": 6,
+    "Lane_1": 3
+  },
+  "vehicle_types": {
+    "car": 8,
+    "bus": 1
+  },
+  "uptime_seconds": 60.1,
+  "alert": true,
+  "active_tracks": 15,
+  "speed_estimates_kmh": {
+    "146": 0.0,
+    "156": 0.0,
+    "163": 6.6,
+    "167": 0.7,
+    "172": 0.5,
+    "177": 6.4,
+    "189": 1.2,
+    "192": 2.6,
+    "194": 1.5,
+    "198": 6.1,
+    "203": 1.9,
+    "204": 1.0
+  },
+  "avg_speed_kmh": 2.4,
+  "sudden_stops": [
+    146,
+    156,
+    167,
+    172,
+    189,
+    192,
+    194,
+    203,
+    204
+  ]
+}

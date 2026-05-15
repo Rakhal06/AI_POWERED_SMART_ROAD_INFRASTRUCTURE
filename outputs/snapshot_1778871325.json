@@ -1,0 +1,15 @@
+{
+  "timestamp": 1778871325.9,
+  "fps": 7.05,
+  "total_vehicles": 0,
+  "density_level": "LOW",
+  "flow_rate_per_min": 0.0,
+  "lane_counts": {},
+  "vehicle_types": {},
+  "uptime_seconds": 40.3,
+  "alert": false,
+  "active_tracks": 0,
+  "speed_estimates_kmh": {},
+  "avg_speed_kmh": 0.0,
+  "sudden_stops": []
+}

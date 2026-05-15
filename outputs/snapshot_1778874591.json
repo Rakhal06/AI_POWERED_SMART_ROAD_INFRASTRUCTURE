@@ -1,0 +1,53 @@
+{
+  "timestamp": 1778874591.18,
+  "fps": 12.97,
+  "total_vehicles": 7,
+  "density_level": "MODERATE",
+  "flow_rate_per_min": 6648.7,
+  "avg_speed_kmh": 2.1,
+  "median_speed_kmh": 5.5,
+  "vehicle_speeds_kmh": {
+    "136": 10.7,
+    "139": 6.7,
+    "146": 1.6,
+    "137": 15.1,
+    "150": 4.3,
+    "155": 0.0,
+    "144": 3.0
+  },
+  "lane_counts": {
+    "OUT_OF_ROI": 7
+  },
+  "vehicle_types": {
+    "car": 5,
+    "bus": 1,
+    "truck": 1
+  },
+  "uptime_seconds": 50.1,
+  "alert": false,
+  "speed_alert": true,
+  "active_tracks": 13,
+  "speed_estimates_kmh": {
+    "123": 0.5,
+    "136": 0.5,
+    "137": 0.5,
+    "139": 0.5,
+    "140": 3.6,
+    "141": 4.5,
+    "142": 5.5,
+    "144": 1.4,
+    "146": 1.5,
+    "147": 1.9,
+    "150": 2.2
+  },
+  "sudden_stops": [
+    123,
+    136,
+    137,
+    139,
+    144,
+    146,
+    147,
+    150
+  ]
+}
