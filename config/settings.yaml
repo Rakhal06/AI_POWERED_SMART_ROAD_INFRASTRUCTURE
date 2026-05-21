@@ -1,53 +1,149 @@
+# config/settings.yaml
+# Smart RSU — AI Traffic Intelligence Engine
+# IIT Madras National Road Safety Hackathon 2026
+
+# ─── DETECTOR ────────────────────────────────────────────────────
 model:
-  path: "models/yolov8n.pt"
+  backend: yolo              # rtdetr | yolo | onnx  (start with yolo for testing)
+  name: yolov8n              # yolov8n | yolov8s | rtdetr-l | rtdetrv2-l
+  path: models/yolov8n.pt    # auto-downloaded if not present
   confidence_threshold: 0.45
-  iou_threshold: 0.5
-  device: "cpu"            # change to "0" for GPU, "mps" for Apple Silicon
+  iou_threshold: 0.45
+  device: cpu               # cuda | cpu | mps
+  input_size: 640
 
-camera:
-  source: "datasets/traffic.mp4"               # 0 = webcam, or "/dev/video0" on Pi, or "rtsp://..."
-  width: 1280
-  height: 720
-  fps_target: 30
-
+# ─── VEHICLE CLASSES (COCO) ──────────────────────────────────────
 vehicle_classes:
-  2: "car"
-  3: "motorcycle"
-  5: "bus"
-  7: "truck"
+  2:  car
+  3:  motorcycle
+  5:  bus
+  7:  truck
 
+# ─── TRACKER ─────────────────────────────────────────────────────
+tracker:
+  backend: bytetrack
+  stop_speed_kmh: 3.0
+  wrong_way_angle_gap_deg: 150
+  min_track_age_frames: 5
+  pixels_per_meter: 91.4    # fallback if calibration disabled
+
+# ─── CALIBRATION ─────────────────────────────────────────────────
+calibration:
+  mode: hybrid               # auto | hybrid | manual
+  lane_width_m: 3.65
+  recalibration_interval_frames: 300
+  min_confidence: 0.50
+  debug_overlay: true
+
+  homography:
+    src_pts:
+      - [256, 323]
+      - [386, 325]
+      - [334, 129]
+      - [315, 129]
+    dst_pts:
+      - [0.0,  0.0]
+      - [3.65, 0.0]
+      - [0.0, 10.0]
+      - [3.65, 10.0]
+
+  roi_ratio: 0.60
+  canny_low: 50
+  canny_high: 150
+  hough_threshold: 35
+  min_line_length: 40
+  max_line_gap: 80
+
+# ─── LANES ───────────────────────────────────────────────────────
 lanes:
-  enabled: true
-  regions:
-    - name: "Lane_1"
-      points: [[0, 300], [640, 300], [640, 720], [0, 720]]
-    - name: "Lane_2"
-      points: [[640, 300], [1280, 300], [1280, 720], [640, 720]]
+  enabled: false              # set true to enable polygon ROI lane assignment
+  expected_direction: RIGHT   # RIGHT | LEFT | UP | DOWN (for wrong-way detection)
+  regions: []
+  # To enable lanes, define polygon regions like this:
+  # regions:
+  #   - name: Lane_1
+  #     points: [[0, 360], [213, 360], [280, 200], [180, 200]]
+  #   - name: Lane_2
+  #     points: [[213, 360], [426, 360], [400, 200], [280, 200]]
+  #   - name: Lane_3
+  #     points: [[426, 360], [640, 360], [520, 200], [400, 200]]
 
+  # Virtual tripwire line for vehicle counting (line-crossing counter)
+  tripwire:
+    enabled: false
+    # Horizontal line across the frame at y_pct of frame height
+    y_pct: 0.75              # 0.0 = top, 1.0 = bottom
+
+# ─── ANALYTICS ───────────────────────────────────────────────────
 analytics:
   density_thresholds:
     low: 3
-    medium: 8
-    high: 15
-  snapshot_interval_seconds: 10
-  output_dir: "outputs/"
+    medium: 7
+    high: 12
+  speed_alert_kmh: 20
+  output_dir: outputs/
+  snapshot_interval_seconds: 5
+  flow_window_seconds: 60
 
-logging:
-  level: "INFO"
-  log_dir: "logs/"
-
-
-tracker:
-  pixels_per_meter: 91.4      # calibrate: lane_width_px / 3.5m
-  stop_speed_kmh: 3.0         # below this = vehicle considered stopped
-  wrong_way_angle_gap_deg: 150.0
-  min_track_age_frames: 5     # ignore brand-new detections
-
-  lanes:
+# ─── ANOMALY DETECTION ───────────────────────────────────────────
+anomaly:
   enabled: true
-  expected_direction: "RIGHT"    # ← add this line
-  regions:
-    - name: "Lane_1"
-      points: [[0, 300], [640, 300], [640, 720], [0, 720]]
-    - name: "Lane_2"
-      points: [[640, 300], [1280, 300], [1280, 720], [640, 720]]
+  # Accident detection
+  accident_confidence_threshold: 70     # 0-100, alert fires above this
+  aspect_ratio_inversion_score: 60      # points added when bbox inverts (overturned vehicle)
+  vibration_spike_score: 40             # points added when hw vibration fires simultaneously
+  sudden_stop_score: 30                 # points added on sudden stop
+  # Stopped vehicle detection
+  stopped_speed_kmh: 4.0
+  stopped_min_frames: 45                # vehicle must be stopped for this many frames
+  # Wrong-way
+  wrong_way_enabled: true
+  # Overspeeding (prototype: relative to typical traffic speed)
+  overspeed_multiplier: 1.8             # trigger if vehicle > mean_speed * multiplier
+
+# ─── CAMERA ──────────────────────────────────────────────────────
+camera:
+  source: datasets/traffic.mp4  # 0 = webcam | simulation | RTSP URL | video file
+  fps_target: 30
+  resolution: [640, 360]
+  roi:
+    enabled: false
+    x: 0
+    y: 0
+    w: 640
+    h: 360
+
+# ─── HARDWARE (ESP32 Serial Bridge) ──────────────────────────────
+hardware:
+  enabled: false              # set true when ESP32 is connected
+  port: COM3                  # Windows: COM3 | Linux/Pi: /dev/ttyUSB0
+  baud_rate: 115200
+  timeout_s: 0.05
+  # Expected JSON format from ESP32:
+  # {"vibration": false, "ultrasonic_cm": [120, 85, 200, 160],
+  #  "radar_present": [true, false, true, false],
+  #  "gps_lat": 13.0827, "gps_lon": 80.2707}
+
+# ─── EDGE DEPLOYMENT ─────────────────────────────────────────────
+edge:
+  export_format: onnx         # onnx | tensorrt | openvino
+  quantization: fp16          # fp32 | fp16 | int8
+  target_device: jetson_nano  # jetson_nano | jetson_orin | rpi5 | x86_cpu
+  trt_workspace_gb: 2
+
+# ─── DISPLAY ─────────────────────────────────────────────────────
+display:
+  show_window: true
+  window_title: "Smart RSU — AI Traffic Intelligence | IIT Madras Hackathon 2026"
+  show_tracks: true
+  show_speed: true
+  show_lane_overlay: true
+  show_calibration_debug: true
+  show_bev: false
+  record_output: false
+  output_video_path: outputs/recorded.mp4
+
+# ─── LOGGING ─────────────────────────────────────────────────────
+logging:
+  level: INFO                 # DEBUG | INFO | WARNING | ERROR
+  log_dir: logs

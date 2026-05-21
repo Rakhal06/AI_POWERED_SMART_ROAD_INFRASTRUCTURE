@@ -1,104 +1,161 @@
 """
-VehicleTracker — Trajectory history and speed/direction analysis.
+tracker.py — Vehicle trajectory state manager.
 
-Wraps ByteTrack (built into YOLOv8 via model.track(persist=True)).
-This module manages per-track state AFTER YOLO assigns IDs:
-  - stores centroid history per track_id
-  - computes speed estimate from pixel displacement
-  - computes dominant motion direction
-  - detects sudden stops
-  - detects wrong-way movement
+DESIGN CHANGE (v2):
+  Speed computation has been REMOVED from this module.
+  TrafficAnalyzer owns all speed estimation via homography + Kalman filter.
+  This module owns:
+    - Centroid trajectory history (for direction + AnomalyEngine)
+    - ByteTrack ID management (via YOLO's built-in tracker)
+    - Direction analysis (RIGHT / LEFT / UP / DOWN / UNKNOWN)
+    - Wrong-way flag (set by AnomalyEngine or pipeline based on analyzer speed)
+    - Line-crossing vehicle counter (virtual tripwire)
+    - Stale track cleanup
+
+  Speed-dependent anomaly detection (sudden stop) is now in AnomalyEngine,
+  which receives speeds directly from TrafficAnalyzer.speed_estimator.
+
+Usage:
+    tracker = VehicleTracker(cfg)
+
+    # Each frame:
+    tracker.update(detections)
+    direction = tracker.get_direction(track_id)
+    wrong_way = tracker.get_wrong_way_vehicles(expected_direction="RIGHT")
+    count_crossed = tracker.tripwire_count
+    all_states = tracker.get_all_states()
 """
 
 import logging
 import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Direction buckets (degrees, 0 = right, 90 = up, 180 = left, 270 = down)
-DIRECTION_LABELS = {
+# Direction buckets (angle in degrees: 0=right, 90=up, 180=left, 270=down)
+_DIRECTION_MAP = {
     (0,   45):  "RIGHT",
     (45,  135): "UP",
     (135, 225): "LEFT",
     (225, 315): "DOWN",
-    (315, 360): "RIGHT",
+    (315, 361): "RIGHT",
 }
 
 
 def _angle_deg(dx: float, dy: float) -> float:
-    """Returns angle in degrees [0, 360) from pixel displacement vector."""
-    angle = math.degrees(math.atan2(-dy, dx))  # negate dy: pixel y grows downward
-    return angle % 360
+    """Angle [0, 360) from a pixel displacement vector. Pixel Y grows downward."""
+    return math.degrees(math.atan2(-dy, dx)) % 360
 
 
-def _direction_label(angle: float) -> str:
-    for (lo, hi), label in DIRECTION_LABELS.items():
+def _dir_label(angle: float) -> str:
+    for (lo, hi), label in _DIRECTION_MAP.items():
         if lo <= angle < hi:
             return label
     return "RIGHT"
 
 
+# ─────────────────────────────────────────────────────────────────
+# PER-TRACK STATE
+# ─────────────────────────────────────────────────────────────────
+
 @dataclass
 class TrackState:
-    """Per-vehicle persistent state."""
-    track_id: int
-    history: deque = field(default_factory=lambda: deque(maxlen=30))  # (x, y, timestamp_idx)
-    speed_kmh: float = 0.0
+    """Trajectory + direction state for one tracked vehicle."""
+    track_id:       int
+    # (x, y, frame_index) — latest first via appendleft
+    history:        deque = field(default_factory=lambda: deque(maxlen=30))
     direction_angle: float = 0.0
-    direction_label: str = "UNKNOWN"
-    is_stopped: bool = False
-    wrong_way: bool = False
-    age_frames: int = 0          # how many frames this track has existed
-    last_seen_frame: int = 0
+    direction_label: str   = "UNKNOWN"
+    wrong_way:      bool   = False
+    age_frames:     int    = 0
+    last_seen_frame: int   = 0
+    # tripwire: True once this track has crossed the virtual line
+    crossed_tripwire: bool = False
 
+
+# ─────────────────────────────────────────────────────────────────
+# LINE-CROSSING COUNTER (virtual tripwire)
+# ─────────────────────────────────────────────────────────────────
+
+class TripwireCounter:
+    """
+    Counts vehicles that cross a horizontal line at y = frame_height * y_pct.
+    A vehicle "crosses" when its centroid transitions from above to below the line.
+    Only counts each track_id once.
+    """
+
+    def __init__(self, y_pct: float = 0.75):
+        self.y_pct  = y_pct            # fraction of frame height
+        self._count = 0
+        self._seen:  Dict[int, bool] = {}  # track_id -> was_above
+
+    def update(self, track_id: int, cy: float, frame_h: int) -> bool:
+        """Returns True if this call triggered a new crossing."""
+        line_y = frame_h * self.y_pct
+        above  = cy < line_y
+        was_above = self._seen.get(track_id, above)  # assume no crossing on first frame
+
+        if was_above and not above:
+            # Crossed from above to below — count it
+            self._count += 1
+            self._seen[track_id] = above
+            logger.debug("Tripwire crossed by track %d | total=%d", track_id, self._count)
+            return True
+
+        self._seen[track_id] = above
+        return False
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def reset(self) -> None:
+        self._count = 0
+        self._seen.clear()
+
+
+# ─────────────────────────────────────────────────────────────────
+# VEHICLE TRACKER
+# ─────────────────────────────────────────────────────────────────
 
 class VehicleTracker:
     """
-    Manages per-vehicle trajectory state using YOLO ByteTrack IDs.
+    Manages per-vehicle trajectory state on top of ByteTrack IDs
+    assigned by the YOLO/RT-DETR detector.
 
-    Usage:
-        tracker = VehicleTracker(cfg)
-        # After detector.infer(frame) returns detections with track_ids:
-        tracker.update(detections, frame_index, fps)
-        speed = tracker.get_speed(track_id)
-        direction = tracker.get_direction(track_id)
-        stops = tracker.get_sudden_stops()
-        wrong_way = tracker.get_wrong_way_vehicles(expected_direction="RIGHT")
+    This module does NOT compute speed — that belongs to TrafficAnalyzer.
     """
 
     def __init__(self, cfg: dict):
-        """
-        cfg: the full settings.yaml dict.
-        Uses camera.fps_target and analytics.density_thresholds for calibration.
-        """
-        # Pixel-to-meter calibration.
-        # Default: assume lane width = 3.5m visible across half frame width (640/2 = 320px)
-        # Override in settings.yaml under tracker.pixels_per_meter
         tracker_cfg = cfg.get("tracker", {})
-        self.pixels_per_meter: float = tracker_cfg.get("pixels_per_meter", 320 / 3.5)
-        self.stop_speed_threshold: float = tracker_cfg.get("stop_speed_kmh", 3.0)
-        self.wrong_way_angle_gap: float = tracker_cfg.get("wrong_way_angle_gap_deg", 150.0)
-        self.min_track_age: int = tracker_cfg.get("min_track_age_frames", 5)
+        self.min_track_age          = tracker_cfg.get("min_track_age_frames", 5)
+        self.wrong_way_angle_gap    = float(tracker_cfg.get("wrong_way_angle_gap_deg", 150.0))
+        self._direction_history_len = 10   # frames of direction smoothing
 
-        self._tracks: Dict[int, TrackState] = {}
-        self._frame_index: int = 0
+        # Tripwire
+        tripwire_cfg = cfg.get("lanes", {}).get("tripwire", {})
+        tw_enabled   = tripwire_cfg.get("enabled", False)
+        tw_y_pct     = float(tripwire_cfg.get("y_pct", 0.75))
+        self.tripwire = TripwireCounter(y_pct=tw_y_pct) if tw_enabled else None
+
+        self._tracks:       Dict[int, TrackState] = {}
+        self._frame_index:  int = 0
 
         logger.info(
-            f"VehicleTracker initialized | "
-            f"px/m={self.pixels_per_meter:.1f} | "
-            f"stop_threshold={self.stop_speed_threshold} km/h"
+            "VehicleTracker v2 | min_age=%d | wrong_way_gap=%.0f° | tripwire=%s",
+            self.min_track_age,
+            self.wrong_way_angle_gap,
+            f"enabled at y={tw_y_pct:.0%}" if tw_enabled else "disabled",
         )
 
-    # ── PUBLIC API ────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────
 
-    def update(self, detections: list, fps: float) -> None:
+    def update(self, detections: list, frame_shape: tuple = None) -> None:
         """
-        Call once per frame with the current list of Detection objects.
-        detections: List[Detection] from VehicleDetector.infer()
-        fps: current measured FPS (used for speed calculation)
+        Call once per frame with the current List[Detection].
+        frame_shape: (height, width) — required for tripwire.
         """
         self._frame_index += 1
         active_ids = set()
@@ -106,128 +163,103 @@ class VehicleTracker:
         for det in detections:
             tid = det.track_id
             if tid < 0:
-                continue  # untracked detection (ByteTrack failed to assign)
-
+                continue
             active_ids.add(tid)
 
             if tid not in self._tracks:
                 self._tracks[tid] = TrackState(track_id=tid)
-                logger.debug(f"New track: ID={tid}")
 
             state = self._tracks[tid]
-            state.history.append((det.center[0], det.center[1], self._frame_index))
+            cx, cy = float(det.center[0]), float(det.center[1])
+            state.history.append((cx, cy, self._frame_index))
             state.age_frames += 1
             state.last_seen_frame = self._frame_index
 
-            # Only analyze tracks old enough to have meaningful history
-            if state.age_frames >= self.min_track_age and len(state.history) >= 2:
-                self._compute_kinematics(state, fps)
+            # Direction analysis (requires at least min_age frames)
+            if state.age_frames >= self.min_track_age and len(state.history) >= 4:
+                self._compute_direction(state)
 
-        # Mark stale tracks (not seen for >30 frames) for cleanup
+            # Tripwire
+            if self.tripwire is not None and frame_shape is not None:
+                self.tripwire.update(tid, cy, frame_shape[0])
+
+        # Purge stale tracks (not seen for >30 frames)
         stale = [
             tid for tid, st in self._tracks.items()
             if self._frame_index - st.last_seen_frame > 30
         ]
         for tid in stale:
-            logger.debug(f"Track expired: ID={tid}")
             del self._tracks[tid]
 
-    def get_speed(self, track_id: int) -> float:
-        """Returns latest speed estimate in km/h for a track ID. 0.0 if unknown."""
-        state = self._tracks.get(track_id)
-        return state.speed_kmh if state else 0.0
-
     def get_direction(self, track_id: int) -> str:
-        """Returns direction label: RIGHT / LEFT / UP / DOWN / UNKNOWN."""
-        state = self._tracks.get(track_id)
-        return state.direction_label if state else "UNKNOWN"
-
-    def get_all_speeds(self) -> Dict[int, float]:
-        """Returns {track_id: speed_kmh} for all active tracks."""
-        return {
-            tid: st.speed_kmh
-            for tid, st in self._tracks.items()
-            if st.age_frames >= self.min_track_age
-        }
-
-    def get_sudden_stops(self) -> List[int]:
-        """
-        Returns list of track IDs that just stopped (were moving, now stopped).
-        Useful for accident detection.
-        """
-        return [
-            tid for tid, st in self._tracks.items()
-            if st.is_stopped and st.age_frames >= self.min_track_age
-        ]
+        st = self._tracks.get(track_id)
+        return st.direction_label if st else "UNKNOWN"
 
     def get_wrong_way_vehicles(self, expected_direction: str = "RIGHT") -> List[int]:
         """
-        Returns track IDs moving against the expected traffic direction.
-        expected_direction: one of RIGHT / LEFT / UP / DOWN
+        Returns track IDs moving against expected_direction.
+        Marks state.wrong_way accordingly.
         """
-        expected_angle = {"RIGHT": 0, "UP": 90, "LEFT": 180, "DOWN": 270}.get(
-            expected_direction.upper(), 0
-        )
+        expected_angle = {
+            "RIGHT": 0.0, "UP": 90.0, "LEFT": 180.0, "DOWN": 270.0
+        }.get(expected_direction.upper(), 0.0)
+
         wrong = []
         for tid, st in self._tracks.items():
             if st.age_frames < self.min_track_age:
                 continue
-            angle_diff = abs(st.direction_angle - expected_angle)
-            if angle_diff > 180:
-                angle_diff = 360 - angle_diff
-            if angle_diff > self.wrong_way_angle_gap:
-                st.wrong_way = True
+            diff = abs(st.direction_angle - expected_angle)
+            if diff > 180.0:
+                diff = 360.0 - diff
+            st.wrong_way = diff > self.wrong_way_angle_gap
+            if st.wrong_way:
                 wrong.append(tid)
-            else:
-                st.wrong_way = False
         return wrong
 
     def get_track_state(self, track_id: int) -> Optional[TrackState]:
         return self._tracks.get(track_id)
 
+    def get_all_states(self) -> Dict[int, TrackState]:
+        """Returns all active track states for AnomalyEngine consumption."""
+        return dict(self._tracks)
+
     def active_track_count(self) -> int:
         return len(self._tracks)
 
-    # ── INTERNAL ──────────────────────────────────────────────────
+    @property
+    def tripwire_count(self) -> int:
+        """Total vehicles that have crossed the virtual tripwire line."""
+        return self.tripwire.count if self.tripwire else 0
 
-    def _compute_kinematics(self, state: TrackState, fps: float) -> None:
+    def summary(self) -> dict:
+        """JSON-serializable summary for analytics merging."""
+        return {
+            "active_tracks":  self.active_track_count(),
+            "tripwire_count": self.tripwire_count,
+        }
+
+    # ── Internal ──────────────────────────────────────────────────
+
+    def _compute_direction(self, state: TrackState) -> None:
         """
-        Computes speed and direction from the last 2 history points.
-        Speed = pixel displacement / fps * pixels_per_meter * 3.6
-        Direction = atan2 of displacement vector.
+        Computes direction from the displacement across the last N history points.
+        Using N=6 frames of averaging suppresses jitter without adding latency.
         """
         pts = list(state.history)
-        if len(pts) < 2:
+        if len(pts) < 4:
             return
 
-        # Use latest two points
-        x1, y1, f1 = pts[-2]
-        x2, y2, f2 = pts[-1]
+        # Use last 6 points for smoothed direction vector
+        window = pts[-min(6, len(pts)):]
+        x1, y1, _ = window[0]
+        x2, y2, _ = window[-1]
 
         dx = x2 - x1
         dy = y2 - y1
-        frame_gap = max(f2 - f1, 1)
 
-        # Pixel distance per frame → meters per second → km/h
-        pixel_dist = math.hypot(dx, dy)
-        meters_per_frame = pixel_dist / self.pixels_per_meter
-        speed_ms = meters_per_frame * fps / frame_gap
-        state.speed_kmh = round(speed_ms * 3.6, 1)
+        # Require meaningful movement to update direction
+        if math.hypot(dx, dy) < 3.0:
+            return
 
-        # Direction
         state.direction_angle = _angle_deg(dx, dy)
-        state.direction_label = _direction_label(state.direction_angle)
-
-        # Sudden stop: was moving (>5 km/h), now below threshold
-        state.is_stopped = state.speed_kmh < self.stop_speed_threshold
-
-    def summary(self) -> dict:
-        """Returns a JSON-serializable summary for analytics output."""
-        speeds = self.get_all_speeds()
-        avg_speed = round(sum(speeds.values()) / len(speeds), 1) if speeds else 0.0
-        return {
-            "active_tracks": self.active_track_count(),
-            "speed_estimates_kmh": speeds,
-            "avg_speed_kmh": avg_speed,
-            "sudden_stops": self.get_sudden_stops(),
-        }
+        state.direction_label = _dir_label(state.direction_angle)
